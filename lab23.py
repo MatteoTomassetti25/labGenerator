@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-lab_generator_v11.py (modificato)
+lab_generator.py
 - Sposta i comandi di debug BGP globali sotto 'log file /var/log/frr/frr.log'
   invece che dentro la sezione 'router bgp ...'
 """
@@ -124,7 +124,7 @@ ip route add default via {gateway} dev eth0
 
 STARTUP_WWW_TMPL = """ip address add {ip} dev eth0
 ip route add default via {gateway} dev eth0
-service apache2 start
+systemctl start apache2 
 """
 
 WWW_INDEX = """<html><head><title>www</title></head><body><h1>Server WWW</h1></body></html>"""
@@ -711,6 +711,101 @@ def get_first_iface_ip(ifaces):
         return None
     return ip_cidr.split("/")[0]
 
+
+def _strip_cidr(ip_cidr):
+    if not ip_cidr:
+        return None
+    return str(ip_cidr).split('/')[0]
+
+
+def collect_lab_ips(lab_path, routers=None):
+    """Raccoglie gli endpoint del lab: tutte le IP associate a interfacce.
+
+    Restituisce una lista di dict con chiavi: 'ip', 'name', 'iface'.
+    - Se `routers` è fornito (dict), prende gli IP dalle interfacce dei router
+      e imposta 'name' al nome del router e 'iface' al nome dell'interfaccia.
+    - Scansiona i file `*.startup` nella directory del lab per trovare tutte le
+      occorrenze di `ip address add <ip>` e aggiunge record con 'name' = nome
+      del file (senza .startup) e 'iface' se presente nella riga.
+    Mantiene l'ordine di scoperta e rimuove duplicati identici (stesso IP, name, iface).
+    """
+    endpoints = []
+    seen = set()
+    # dai router
+    if routers:
+        for rname, rdata in routers.items():
+            for iface in rdata.get('interfaces', []):
+                ip = _strip_cidr(iface.get('ip'))
+                if ip:
+                    key = (ip, rname, iface.get('name'))
+                    if key not in seen:
+                        seen.add(key)
+                        endpoints.append({'ip': ip, 'name': rname, 'iface': iface.get('name')})
+
+    # dai file .startup (tutte le occorrenze)
+    try:
+        for fname in os.listdir(lab_path):
+            if not fname.endswith('.startup'):
+                continue
+            node_name = fname[:-8]
+            fpath = os.path.join(lab_path, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    for L in f:
+                        if 'ip address add' in L:
+                            parts = L.strip().split()
+                            # ip address add <ip> [dev <iface>]
+                            if len(parts) >= 4:
+                                ip = _strip_cidr(parts[3])
+                                iface = None
+                                if 'dev' in parts:
+                                    try:
+                                        dev_idx = parts.index('dev')
+                                        if dev_idx + 1 < len(parts):
+                                            iface = parts[dev_idx + 1]
+                                    except Exception:
+                                        iface = None
+                                key = (ip, node_name, iface)
+                                if ip and key not in seen:
+                                    seen.add(key)
+                                    endpoints.append({'ip': ip, 'name': node_name, 'iface': iface})
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return endpoints
+
+
+def generate_ping_oneliner(endpoints):
+    """Genera una one-liner bash che esegue `ping -c 1` su ogni endpoint.
+
+    `endpoints` è una lista di dict con chiavi: 'ip', 'name', 'iface'. La one-liner
+    esegue un singolo ping per IP e stampa per ogni record: "<ip> (<name> <iface>): <loss> packet loss"
+    o "no reply" se l'output non è parsabile.
+    """
+    if not endpoints:
+        return ''
+    toks = []
+    for e in endpoints:
+        ip = e.get('ip')
+        name = e.get('name') or ''
+        iface = e.get('iface') or ''
+        # escape any double quotes by removing them (names shouldn't contain quotes normally)
+        token = f"{ip}|{name}|{iface}"
+        toks.append(f'"{token}"')
+    recs = ' '.join(toks)
+    # single probe, print packet loss percentage extracted from ping summary
+    cmd = (
+        "for rec in " + recs + "; do IFS='|' read -r ip name iface <<< \"$rec\"; "
+        "out=$(ping -c 1 \"$ip\" 2>&1); "
+        "loss=$(echo \"$out\" | awk -F',' '/packet loss/ {print $3}' | awk '{print $1}'); "
+        "if [ -z \"$loss\" ]; then echo -e \"❌ $ip ($name $iface): no reply\"; else "
+        "loss_num=$(echo \"$loss\" | tr -d '%'); "
+        "if [ \"$loss_num\" = \"0\" ]; then echo -e \"✅ $ip ($name $iface): $loss packet loss\"; else echo -e \"❌ $ip ($name $iface): $loss packet loss\"; fi; fi; done"
+    )
+    return cmd
+
 def find_routers_by_asn(routers, asn):
     return [name for name, r in routers.items() if str(r.get("asn","")) == str(asn)]
 
@@ -782,6 +877,7 @@ def menu_post_creazione(base_path, routers):
         print('1) Imposta costo OSPF su una interfaccia di un router')
         print('2) Imposta preferenza su un router per dare priorità agli annunci da un neighbor')
         print('3) Rigenera file XML del laboratorio (da file modificati)')
+        print('4) Genera comando ping per tutti gli indirizzi del lab (copia/incolla)')
         print('0) Esci dal menu')
         choice = input('Seleziona (numero): ').strip()
         if choice == '0':
@@ -800,6 +896,18 @@ def menu_post_creazione(base_path, routers):
                     print("❌ Rigenerazione XML non riuscita.")
             except Exception as e:
                 print('Errore durante la rigenerazione XML:', e)
+        elif choice == '4':
+            try:
+                ips = collect_lab_ips(base_path, routers)
+                if not ips:
+                    print('Nessun IP trovato nel lab. Controlla i file .startup o le interfacce dei router.')
+                else:
+                    cmd = generate_ping_oneliner(ips)
+                    print('\n=== Comando ping generato (copia/incolla sulle macchine del lab) ===\n\n')
+                    print(cmd)
+                    print('\n\n=== Fine comando ===\n')
+            except Exception as e:
+                print('Errore generando il comando ping:', e)
         else:
             print('Scelta non valida, riprova.')
 
@@ -1118,7 +1226,7 @@ def rebuild_lab_metadata_and_export(lab_path):
 # -------------------------
 def main():
     # supporto modalità non-interattiva: --from-xml / --from-json
-    parser = argparse.ArgumentParser(description='Generatore Kathará v11')
+    parser = argparse.ArgumentParser(description='Generatore Kathará')
     parser.add_argument('--from-xml', help='Percorso file XML da importare per creare il lab')
     parser.add_argument('--from-json', help='Percorso file JSON da importare per creare il lab')
     parser.add_argument('--regen-xml', help='Percorso della directory del lab per rigenerare il file XML')
@@ -1144,11 +1252,12 @@ def main():
         return
 
     # Modalità interattiva: chiedi all'utente se creare o importare
-    print("=== Generatore Kathará v11 ===")
+    print("=== Generatore Kathará ===")
     print("Scegli modalità:")
     print("  C - Crea nuovo laboratorio (interattivo)")
     print("  I - Importa da file (XML/JSON)")
     print("  G - Rigenera XML di un lab esistente")
+    print("  P - Genera comando ping per un lab esistente (copia/incolla)")
     print("  Q - Esci")
     while True:
         mode = input_non_vuoto("Seleziona (C/I/G/Q): ").strip().lower()
@@ -1195,6 +1304,32 @@ def main():
                 print(f"✅ XML rigenerato: {out}")
             else:
                 print("❌ Rigenerazione XML fallita.")
+            return
+        if mode.startswith('p'):
+            target = input_non_vuoto('Percorso della directory del lab per generare il comando ping: ')
+            if not os.path.isdir(target):
+                print(f"Directory non trovata: {target}")
+                continue
+            # proviamo a leggere routers.xml se presente (semplifica raccolta IP), ma la funzione
+            # collect_lab_ips può operare anche senza routers
+            routers_meta = None
+            try:
+                xmlpath = os.path.join(target, os.path.basename(os.path.normpath(target)) + '.xml')
+                if os.path.exists(xmlpath):
+                    try:
+                        _, routers_meta, _, _, _ = load_lab_from_xml(xmlpath)
+                    except Exception:
+                        routers_meta = None
+            except Exception:
+                routers_meta = None
+            ips = collect_lab_ips(target, routers_meta)
+            if not ips:
+                print('Nessun IP trovato nella directory del lab. Controlla che ci siano file .startup o i router con interfacce.')
+                continue
+            cmd = generate_ping_oneliner(ips)
+            print('\n=== Comando ping generato (copia/incolla sulle macchine del lab) ===\n\n')
+            print(cmd)
+            print('\n\n=== Fine comando ===\n')
             return
         print('Scelta non valida, riprova.')
 
