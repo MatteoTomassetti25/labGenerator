@@ -70,6 +70,16 @@ def valida_protocols(prompt):
             return list(dict.fromkeys(toks))
         print("❌ Usa solo: bgp ospf rip")
 
+def valida_lan(prompt):
+    """Valida che il nome della LAN inizi con una lettera maiuscola."""
+    while True:
+        s = input(prompt).strip()
+        if not s:
+            print("❌ Il nome della LAN non può essere vuoto.")
+            continue
+        if s[0].isalpha() and s[0].isupper():
+            return s
+        print("❌ Il nome della LAN deve iniziare con una lettera maiuscola (es. A, Lan1).")
 # -------------------------
 # Templates
 # -------------------------
@@ -1171,7 +1181,11 @@ def main():
                     continue
                 break
             print(f"--- Configurazione router {rname} ---")
-            protocols = valida_protocols(f"Protocolli attivi per {rname} (bgp/ospf/rip, separati da spazio): ")
+            while True:  # Conferma per i protocolli
+                protocols = valida_protocols(f"Protocolli attivi per {rname} (bgp/ospf/rip, separati da spazio): ")
+                if conferma(f"Confermi protocolli '{', '.join(protocols)}' per {rname}? (s/N): "):
+                    break
+
             asn = ""
             if "bgp" in protocols: # Conferma per ASN
                 while True:
@@ -1187,11 +1201,11 @@ def main():
             interfaces = []
             for idx in range(n_if):
                 eth = f"eth{idx}"
-                while True: # Conferma per LAN associata
-                    lan = input_non_vuoto(f"  LAN per {eth} (es. A): ").upper()
+                while True:  # Conferma per LAN associata
+                    lan = valida_lan(f"  LAN per {eth} (es. A): ")
                     if conferma(f"Confermi LAN '{lan}' per {eth}? (s/N): "):
                         break
-                while True: # Conferma per IP interfaccia
+                while True:  # Conferma per IP interfaccia
                     ip_cidr = valida_ip_cidr(f"  IP/CIDR per {eth} (es. 10.0.{i}.{idx}/24): ")
                     if conferma(f"Confermi IP '{ip_cidr}' per {eth}? (s/N): "):
                         break
@@ -1232,7 +1246,7 @@ def main():
             print(f"--- Configurazione host {hname} ---")
             ip = valida_ip_cidr(f"IP/CIDR per {hname} (es. 192.168.10.{h}/24): ")
             gw = valida_ip_senza_cidr(f"Gateway per {hname} (es. 192.168.10.1): ")
-            lan = input_non_vuoto("LAN associata (es. A): ").upper()
+            lan = valida_lan("LAN associata (es. A): ")
 
             # Chiedi conferma prima di scrivere i file
             if conferma(f"Vuoi creare l'host '{hname}' con questa configurazione? (s/N): "):
@@ -1264,7 +1278,7 @@ def main():
             print(f"--- Configurazione webserver {wname} ---")
             ip = valida_ip_cidr(f"IP/CIDR per {wname} (es. 10.10.{w}.1/24): ")
             gw = valida_ip_senza_cidr(f"Gateway per {wname} (es. 10.10.{w}.254): ")
-            lan = input_non_vuoto("LAN associata (es. Z): ").upper()
+            lan = valida_lan("LAN associata (es. Z): ")
 
             # Chiedi conferma prima di scrivere i file
             if conferma(f"Vuoi creare il server WWW '{wname}' con questa configurazione? (s/N): "):
