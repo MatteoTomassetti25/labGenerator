@@ -1,2 +1,2 @@
-test# labGenerator
-Creatore laboratori IDC Roma3
+ labGenerator
+Generatore laboratori IDC Roma3
