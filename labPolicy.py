@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-lab_generator_v11.py (modificato)
+lab_generator.py
 - Sposta i comandi di debug BGP globali sotto 'log file /var/log/frr/frr.log'
   invece che dentro la sezione 'router bgp ...'
 """
@@ -11,7 +11,6 @@ import subprocess
 import argparse
 import json
 import sys
-import re
 
 # -------------------------
 # Utility input / validazioni
@@ -21,6 +20,18 @@ def input_non_vuoto(prompt):
         v = input(prompt).strip()
         if v:
             return v
+
+def input_lan(prompt):
+    """Chiede il nome della LAN e valida che contenga solo lettere e numeri.
+    Ritorna il valore in maiuscolo. Esempi validi: 'A', 'A1', 'LAN2'.
+    Non permette punti o altri caratteri (es. indirizzi IP).
+    """
+    while True:
+        s = input_non_vuoto(prompt).strip().upper()
+        # accetta solo lettere e numeri, almeno 1 carattere
+        if s.isalnum():
+            return s
+        print("❌ Nome LAN non valido. Usa solo lettere e numeri (es. A o A1). Evita punti o indirizzi IP.")
 
 def input_int(prompt, min_val=0):
     while True:
@@ -37,17 +48,12 @@ def valida_ip_cidr(prompt):
     """Valida e ritorna un indirizzo con CIDR (es. 10.0.0.1/24)."""
     while True:
         s = input(prompt).strip()
+        # richiediamo esplicitamente la presenza del prefisso '/'
+        if '/' not in s:
+            print("❌ Inserisci la maschera usando '/' alla fine (es. 192.168.1.1/24)")
+            continue
         try:
-            iface = ipaddress.ip_interface(s)
-            # Controlla che l'IP non sia l'indirizzo di rete o di broadcast
-            # (valido solo per maschere < /31)
-            if iface.network.prefixlen < 31:
-                if iface.ip == iface.network.network_address:
-                    print(f"❌ L'indirizzo {iface.ip} è l'indirizzo di rete e non può essere assegnato a un'interfaccia.")
-                    continue
-                if iface.ip == iface.network.broadcast_address:
-                    print(f"❌ L'indirizzo {iface.ip} è l'indirizzo di broadcast e non può essere assegnato a un'interfaccia.")
-                    continue
+            ipaddress.ip_interface(s)
             return s
         except Exception:
             print("❌ Formato non valido. Usa x.x.x.x/yy (es. 192.168.1.1/24)")
@@ -66,22 +72,10 @@ def valida_protocols(prompt):
     while True:
         s = input(prompt).strip().lower().replace(",", " ")
         toks = [t for t in s.split() if t]
-        if not toks: # Permetti input vuoto
-            return []
         if toks and all(t in allowed for t in toks):
             return list(dict.fromkeys(toks))
         print("❌ Usa solo: bgp ospf rip")
 
-def valida_lan(prompt):
-    """Valida che il nome della LAN inizi con una lettera maiuscola."""
-    while True:
-        s = input(prompt).strip()
-        if not s:
-            print("❌ Il nome della LAN non può essere vuoto.")
-            continue
-        if s[0].isalpha() and s[0].isupper():
-            return s
-        print("❌ Il nome della LAN deve iniziare con una lettera maiuscola (es. A, Lan1).")
 # -------------------------
 # Templates
 # -------------------------
@@ -146,7 +140,7 @@ ip route add default via {gateway} dev eth0
 
 STARTUP_WWW_TMPL = """ip address add {ip} dev eth0
 ip route add default via {gateway} dev eth0
-systemctl start apache2
+systemctl start apache2 
 """
 
 WWW_INDEX = """<html><head><title>www</title></head><body><h1>Server WWW</h1></body></html>"""
@@ -250,15 +244,12 @@ def collapse_interface_networks(interface_ips):
 # -------------------------
 # FRR stanza builders
 # -------------------------
-def mk_bgp_stanza(asn, networks=None, extra_networks=None):
+def mk_bgp_stanza(asn, redistribute=None, networks=None):
     lines = [
         f"router bgp {asn}",
         "    no bgp ebgp-requires-policy",
         "    no bgp network import-check",
     ]
-    all_networks = list(networks) if networks else []
-    if extra_networks:
-        all_networks.extend(extra_networks)
     # networks handled below; redistribute directives will be appended
     # at the end of the 'router bgp' block (after networks) to keep
     # stanza visually grouped.
@@ -267,16 +258,68 @@ def mk_bgp_stanza(asn, networks=None, extra_networks=None):
     # da un supernet comune, viene usato il supernet più specifico che
     # copre l'intero insieme (es. reti 1.2.0.0/24 e 1.3.0.0/24 -> 1.0.0.0/8
     # secondo la policy di copertura richiesta dall'utente)
-    final_nets = set()
-    if all_networks:
-        # Per BGP, non applichiamo la sumarizzazione a /8.
-        # Usiamo le reti così come sono (già collassate a monte)
-        # e le reti extra fornite.
-        final_nets.update(all_networks)
-    
-    for net in sorted(list(final_nets)):
-        lines.append(f"    network {net}")
+    if networks:
+        try:
+            from ipaddress import ip_network, IPv4Network, IPv6Network
+            nets = [ip_network(n) for n in networks]
+            ipv4_nets = [n for n in nets if isinstance(n, IPv4Network)]
+            ipv6_nets = [n for n in nets if isinstance(n, IPv6Network)]
 
+            # Gestione IPv4: valutiamo se usare un byte-aligned supernet (/24,/16,/8)
+            # basandoci sulle reti originali (non solo sul risultato del collapse)
+            if ipv4_nets:
+                collapsed = list(ipaddress.collapse_addresses(ipv4_nets))
+                # Calcola range (min/max) sulle reti originali per permettere
+                # di scegliere un supernet più ampio anche quando il collapse
+                # ha prodotto un singolo network (es. due /24 adiacenti -> /23)
+                min_addr = min(n.network_address for n in ipv4_nets)
+                max_addr = max(n.broadcast_address for n in ipv4_nets)
+
+                # cerca candidati allineati /24, /16, /8 (preferiamo la più specifica tra queste)
+                chosen = None
+                for cand in (24, 16, 8):
+                    mask = ((0xFFFFFFFF << (32 - cand)) & 0xFFFFFFFF)
+                    aligned_int = int(min_addr) & mask
+                    cand_net = IPv4Network((aligned_int, cand))
+                    if int(cand_net.network_address) <= int(min_addr) and int(cand_net.broadcast_address) >= int(max_addr):
+                        chosen = cand_net
+                        break
+
+                # calcola il prefix minimo che copre l'intervallo
+                xor = int(min_addr) ^ int(max_addr)
+                if xor == 0:
+                    # tutte le reti sono identiche
+                    prefixlen = ipv4_nets[0].prefixlen
+                else:
+                    prefixlen = 32 - xor.bit_length()
+
+                min_orig = min(n.prefixlen for n in ipv4_nets)
+
+                # preferiamo un candidato byte-aligned se copre l'intervallo e
+                # non è troppo ampio (soglia minima /8)
+                if chosen is not None and chosen.prefixlen < min_orig and chosen.prefixlen >= 8:
+                    lines.append(f"    network {str(chosen)}")
+                else:
+                    # se il supernet calcolato è più ampio delle reti originali ed è >= /8, usalo
+                    if prefixlen < min_orig and prefixlen >= 8:
+                        net_addr_int = int(min_addr) & (((0xFFFFFFFF << (32 - prefixlen)) & 0xFFFFFFFF))
+                        supern = IPv4Network((net_addr_int, prefixlen))
+                        lines.append(f"    network {str(supern)}")
+                    else:
+                        # fallback: scrivi le network collassate (più conservativo)
+                        for n in collapsed:
+                            lines.append(f"    network {str(n)}")
+
+            # IPv6: mantieni le reti così come sono (no supernetting automatico qui)
+            for n in ipv6_nets:
+                lines.append(f"    network {n}")
+        except Exception:
+            # fallback semplice: stampa le stringhe originali dedupate
+            nets_seen = set()
+            for net in networks:
+                if net not in nets_seen:
+                    lines.append(f"    network {net}")
+                    nets_seen.add(net)
     # NOTE: non aggiungiamo più automaticamente comandi `redistribute`.
     # L'amministratore preferisce gestirli manualmente nel file `frr.conf`.
     # Questo evita policy non desiderate inserite automaticamente.
@@ -285,41 +328,60 @@ def mk_bgp_stanza(asn, networks=None, extra_networks=None):
 
 def mk_ospf_stanza(networks, redistribute=None):
     lines = ["router ospf"]
-    summarized_nets = set()
     if networks:
-        for net_str in networks:
-            try:
-                net = ipaddress.ip_network(net_str, strict=False)
-                if isinstance(net, ipaddress.IPv4Network):
-                    first_octet = str(net.network_address).split('.')[0]
-                    summarized_nets.add(f"{first_octet}.0.0.0/8")
-                else: # IPv6
-                    summarized_nets.add(str(net))
-            except ValueError:
-                continue
-    
-    for net in sorted(list(summarized_nets)):
-        lines.append(f"    network {net} area 0.0.0.0")
+        try:
+            nets = [ipaddress.ip_network(n) for n in networks]
+            ipv4_nets = [n for n in nets if isinstance(n, ipaddress.IPv4Network)]
+            ipv6_nets = [n for n in nets if isinstance(n, ipaddress.IPv6Network)]
+            if ipv4_nets:
+                # collapse contiguous/prefix-overlapping networks first
+                collapsed = list(ipaddress.collapse_addresses(ipv4_nets))
+                # compute minimal covering supernet (use original ipv4_nets for range)
+                min_addr = min(n.network_address for n in ipv4_nets)
+                max_addr = max(n.broadcast_address for n in ipv4_nets)
+                xor = int(min_addr) ^ int(max_addr)
+                if xor == 0:
+                    prefixlen = ipv4_nets[0].prefixlen
+                else:
+                    prefixlen = 32 - xor.bit_length()
+                min_orig = min(n.prefixlen for n in ipv4_nets)
 
+                # Considera il supernet solo se non è troppo ampio (evitiamo /0..../7)
+                # e solo se effettivamente più ampio delle reti originali.
+                if prefixlen < min_orig and prefixlen >= 8:
+                    # build supernet aligned to prefixlen
+                    net_addr_int = int(min_addr) & (~((1 << (32 - prefixlen)) - 1))
+                    supern = ipaddress.IPv4Network((net_addr_int, prefixlen))
+                    # prefer byte-aligned (/24,/16,/8) if they still cover the range
+                    chosen = None
+                    for cand in (24, 16, 8):
+                        mask = (~((1 << (32 - cand)) - 1)) & ((1 << 32) - 1)
+                        aligned_int = int(min_addr) & mask
+                        cand_net = ipaddress.IPv4Network((aligned_int, cand))
+                        if int(cand_net.network_address) <= int(min_addr) and int(cand_net.broadcast_address) >= int(max_addr):
+                            chosen = cand_net
+                            break
+                    if chosen is not None:
+                        lines.append(f"    network {chosen} area 0.0.0.0")
+                    else:
+                        lines.append(f"    network {supern} area 0.0.0.0")
+                else:
+                    # fallback al comportamento più conservativo: scrivi le reti collassate
+                    for n in collapsed:
+                        lines.append(f"    network {n} area 0.0.0.0")
+            # append IPv6 networks without further aggregation
+            for n in ipv6_nets:
+                lines.append(f"    network {n} area 0.0.0.0")
+        except Exception:
+            # fallback: print original strings
+            for net in networks:
+                lines.append(f"    network {net} area 0.0.0.0")
     # Non aggiungiamo automaticamente `redistribute`.
     return "\n".join(lines) + "\n\n"
 
 def mk_rip_stanza(networks, redistribute=None):
     lines = ["router rip"]
-    summarized_nets = set()
-    if networks:
-        for net_str in networks:
-            try:
-                net = ipaddress.ip_network(net_str, strict=False)
-                if isinstance(net, ipaddress.IPv4Network):
-                    first_octet = str(net.network_address).split('.')[0]
-                    summarized_nets.add(f"{first_octet}.0.0.0/8")
-                else: # IPv6
-                    summarized_nets.add(str(net))
-            except ValueError:
-                continue
-    
-    for net in sorted(list(summarized_nets)):
+    for net in networks:
         lines.append(f"    network {net}")
     # Non aggiungiamo automaticamente `redistribute`.
     return "\n".join(lines) + "\n\n"
@@ -327,23 +389,17 @@ def mk_rip_stanza(networks, redistribute=None):
 # -------------------------
 # Creazione file router
 # -------------------------
-def crea_router_files(base_path, rname, router_data):
+def crea_router_files(base_path, rname, data):
     etc_frr = os.path.join(base_path, rname, "etc", "frr")
     os.makedirs(etc_frr, exist_ok=True)
-
-    # Determina i protocolli attivi globalmente sul router basandosi sulle interfacce
-    active_protocols = set()
-    for iface in router_data.get("interfaces", []):
-        for p in iface.get("protocols", []):
-            active_protocols.add(p)
 
     # Forza sempre zebra=yes come richiesto
     zebra_flag = "yes"
     daemons = DAEMONS_TMPL.format(
         zebra=zebra_flag,
-        ripd="yes" if "rip" in active_protocols else "no",
-        ospfd="yes" if "ospf" in active_protocols else "no",
-        bgpd="yes" if "bgp" in active_protocols else "no"
+        ripd="yes" if "rip" in data["protocols"] else "no",
+        ospfd="yes" if "ospf" in data["protocols"] else "no",
+        bgpd="yes" if "bgp" in data["protocols"] else "no"
     )
     with open(os.path.join(etc_frr, "daemons"), "w") as f:
         f.write(daemons)
@@ -355,33 +411,32 @@ def crea_router_files(base_path, rname, router_data):
     parts = [FRR_HEADER]
 
     # Se il router usa BGP, aggiungi debug subito dopo l'intestazione
-    if "bgp" in active_protocols:
+    if "bgp" in data["protocols"]:
         parts.append(
             "debug bgp keepalives\n"
             "debug bgp updates in\n"
             "debug bgp updates out\n"
         )
 
-    # Genera stanze per ogni protocollo, ma solo con le reti pertinenti
-    if "bgp" in active_protocols:
-        bgp_ips = [iface["ip"] for iface in router_data["interfaces"] if "bgp" in iface.get("protocols", [])]
-        bgp_nets = collapse_interface_networks(bgp_ips)
-        parts.append(mk_bgp_stanza(router_data.get("asn", ""), networks=bgp_nets, extra_networks=router_data.get("bgp_extra_networks")))
+    iface_ips = [iface["ip"] for iface in data["interfaces"]]
+    # collapse minimale delle reti collegate; i singoli stanza-builder
+    # (mk_bgp_stanza, mk_ospf_stanza) possono ulteriormente scegliere
+    # di usare un supernet più ampio se rilevano che conviene.
+    aggregated_nets = collapse_interface_networks(iface_ips)
 
-    if "ospf" in active_protocols:
-        ospf_ips = [iface["ip"] for iface in router_data["interfaces"] if "ospf" in iface.get("protocols", [])]
-        ospf_nets = collapse_interface_networks(ospf_ips)
-        parts.append(mk_ospf_stanza(ospf_nets))
-
-    if "rip" in active_protocols:
-        rip_ips = [iface["ip"] for iface in router_data["interfaces"] if "rip" in iface.get("protocols", [])]
-        rip_nets = collapse_interface_networks(rip_ips)
-        parts.append(mk_rip_stanza(rip_nets))
+    # Non creiamo più automaticamente direttive `redistribute`:
+    # l'amministratore preferisce aggiungerle manualmente nel file frr.conf.
+    if "bgp" in data["protocols"]:
+        parts.append(mk_bgp_stanza(data.get("asn", ""), networks=aggregated_nets))
+    if "ospf" in data["protocols"]:
+        parts.append(mk_ospf_stanza(aggregated_nets))
+    if "rip" in data["protocols"]:
+        parts.append(mk_rip_stanza(aggregated_nets))
 
     with open(os.path.join(etc_frr, "frr.conf"), "w") as f:
         f.write("\n".join(parts))
 
-    ip_cfg_lines = [f"ip address add {iface['ip']} dev {iface['name']}" for iface in router_data["interfaces"]]
+    ip_cfg_lines = [f"ip address add {iface['ip']} dev {iface['name']}" for iface in data["interfaces"]]
     startup_path = os.path.join(base_path, f"{rname}.startup")
     with open(startup_path, "w") as f:
         f.write(STARTUP_ROUTER_TMPL.format(ip_config="\n".join(ip_cfg_lines)))
@@ -446,10 +501,7 @@ def aggiungi_relazioni_bgp_menu(base_path, routers):
         if dst not in routers:
             print("Router destinazione non valido.")
             continue
-        
-        src_has_bgp = any("bgp" in iface.get("protocols", []) for iface in routers[src].get("interfaces", []))
-        dst_has_bgp = any("bgp" in iface.get("protocols", []) for iface in routers[dst].get("interfaces", []))
-        if not src_has_bgp or not dst_has_bgp:
+        if "bgp" not in routers[src]["protocols"] or "bgp" not in routers[dst]["protocols"]:
             print("Entrambi i router devono avere BGP abilitato.")
             continue
         rel = input("Tipo relazione (peer/provider/customer): ").strip().lower()
@@ -507,14 +559,8 @@ def auto_generate_bgp_neighbors(base_path, routers):
             for j in range(i+1, len(members)):
                 r1, ip1, asn1 = members[i]
                 r2, ip2, asn2 = members[j]
-                
-                # Controlla se BGP è attivo su almeno un'interfaccia per ciascun router
-                r1_has_bgp = any("bgp" in iface.get("protocols", []) for iface in routers[r1].get("interfaces", []))
-                r2_has_bgp = any("bgp" in iface.get("protocols", []) for iface in routers[r2].get("interfaces", []))
-
-                if not r1_has_bgp or not r2_has_bgp:
+                if "bgp" not in routers[r1]["protocols"] or "bgp" not in routers[r2]["protocols"]:
                     continue
-
                 add_neighbor_if_missing(base_path, r1, ip2, routers[r2]['asn'], desc=f"Router AS{routers[r2]['asn']}{r2}")
                 add_neighbor_if_missing(base_path, r2, ip1, routers[r1]['asn'], desc=f"Router AS{routers[r1]['asn']}{r1}")
 
@@ -681,13 +727,24 @@ def get_first_iface_ip(ifaces):
         return None
     return ip_cidr.split("/")[0]
 
+
 def _strip_cidr(ip_cidr):
     if not ip_cidr:
         return None
     return str(ip_cidr).split('/')[0]
 
+
 def collect_lab_ips(lab_path, routers=None):
-    """Raccoglie gli endpoint del lab: tutte le IP associate a interfacce."""
+    """Raccoglie gli endpoint del lab: tutte le IP associate a interfacce.
+
+    Restituisce una lista di dict con chiavi: 'ip', 'name', 'iface'.
+    - Se `routers` è fornito (dict), prende gli IP dalle interfacce dei router
+      e imposta 'name' al nome del router e 'iface' al nome dell'interfaccia.
+    - Scansiona i file `*.startup` nella directory del lab per trovare tutte le
+      occorrenze di `ip address add <ip>` e aggiunge record con 'name' = nome
+      del file (senza .startup) e 'iface' se presente nella riga.
+    Mantiene l'ordine di scoperta e rimuove duplicati identici (stesso IP, name, iface).
+    """
     endpoints = []
     seen = set()
     # dai router
@@ -735,8 +792,14 @@ def collect_lab_ips(lab_path, routers=None):
 
     return endpoints
 
+
 def generate_ping_oneliner(endpoints):
-    """Genera una one-liner bash che esegue `ping -c 1` su ogni endpoint."""
+    """Genera una one-liner bash che esegue `ping -c 1` su ogni endpoint.
+
+    `endpoints` è una lista di dict con chiavi: 'ip', 'name', 'iface'. La one-liner
+    esegue un singolo ping per IP e stampa per ogni record: "<ip> (<name> <iface>): <loss> packet loss"
+    o "no reply" se l'output non è parsabile.
+    """
     if not endpoints:
         return ''
     toks = []
@@ -758,6 +821,71 @@ def generate_ping_oneliner(endpoints):
         "if [ \"$loss_num\" = \"0\" ]; then echo -e \"✅ $ip ($name $iface): $loss packet loss\"; else echo -e \"❌ $ip ($name $iface): $loss packet loss\"; fi; fi; done"
     )
     return cmd
+
+def find_routers_by_asn(routers, asn):
+    return [name for name, r in routers.items() if str(r.get("asn","")) == str(asn)]
+
+def assegna_costo_interfaccia(base_path, routers):
+    print('\n--- Assegna costo OSPF su una interfaccia di un router ---')
+    target = select_router(routers, prompt='Seleziona il router su cui impostare il costo OSPF:')
+    if not target:
+        print('Operazione annullata.')
+        return
+    # Validation: il router deve avere OSPF abilitato
+    prot = routers.get(target, {}).get('protocols', [])
+    if 'ospf' not in prot:
+        print(f"⚠️ Il router {target} non ha OSPF abilitato (protocols: {prot}). Abilita OSPF prima di impostare il costo.")
+        return
+    iface = select_interface(routers[target])
+    if not iface:
+        print('Interfaccia non selezionata. Annullato.')
+        return
+    costo = input_int(f'Inserisci il costo OSPF desiderato per {iface} (intero ≥ 1): ', 1)
+    stanza = f"interface {iface}\n    ip ospf cost {costo}\n"
+    if append_frr_stanza(base_path, target, stanza):
+        print(f"✅ Costo impostato su {target} {iface} = {costo} (append su frr.conf).")
+
+# implementa_relazioni_as: rimosso — usare la creazione manuale di neighbor o riabilitare se necessario
+
+# asboh_lookup_option: rimosso — l'operazione richiede consultazione esterna
+
+# filter_as10_from_as60: rimosso — puoi riattivare la versione interattiva se ti serve
+
+def preferenza_as50r1(base_path, routers):
+    print('\n--- Imposta preferenza su un router per privilegiar annunci da un neighbor ---')
+    src = select_router(routers, prompt='Seleziona il router sorgente che deve preferire gli annunci:')
+    if not src:
+        print('Operazione annullata.')
+        return
+    print('Seleziona il router preferito (neighbor) dalla lista, o premi invio per inserire IP/ASN manualmente:')
+    neigh = select_router(routers, prompt='Seleziona il router preferito (neighbor):')
+    if neigh:
+        neigh_asn = routers[neigh].get('asn')
+        neigh_ip = get_first_iface_ip(routers[neigh]['interfaces'])
+    else:
+        neigh_asn = input_non_vuoto('ASN del router preferito (es. 70): ')
+        neigh_ip = input_non_vuoto('IP del neighbor (es. 10.0.0.2): ')
+    if not neigh_ip or not neigh_asn:
+        print('Informazioni incomplete; annullato.')
+        return
+    # strip CIDR if user or source provided it accidentally
+    neigh_ip = neigh_ip.split('/')[0] if '/' in neigh_ip else neigh_ip
+    # route-map (globale)
+    policy_lines = [f"route-map PREF_FROM_{neigh_ip.replace('.', '_')} permit 10",
+                    f"    match ip address prefix-list any",
+                    f"    set local-preference 200",
+                    ""]
+    # neighbor lines (da inserire sotto router bgp)
+    neighbor_lines = [f"neighbor {neigh_ip} remote-as {neigh_asn}",
+                      f"neighbor {neigh_ip} route-map PREF_FROM_{neigh_ip.replace('.', '_')} in"]
+    # append policy globalmente
+    with open(os.path.join(base_path, src, 'etc', 'frr', 'frr.conf'), 'a') as f:
+        for L in policy_lines:
+            f.write(L + "\n")
+    # inserisci neighbor nel blocco router bgp
+    insert_lines_into_protocol_block(os.path.join(base_path, src, 'etc', 'frr', 'frr.conf'), proto='bgp', asn=None, lines=neighbor_lines)
+    print(f"✅ Aggiunta preferenza su {src} per annunci provenienti da {neigh_ip} (ASN {neigh_asn}).")
+    print(f"✅ Aggiunta preferenza su {src} per annunci provenienti da {neigh_ip} (ASN {neigh_asn}).")
 
 def ensure_neighbor_exists(fpath, neigh_ip):
     """Se non esiste una riga 'neighbor <ip> remote-as' nel file fpath, chiede ASN e la crea."""
@@ -795,11 +923,8 @@ def policies_menu(base_path, routers):
         if not src:
             print('Annullato.')
             continue
-
-        src_router_data = routers.get(src, {})
-        src_has_bgp = any("bgp" in iface.get("protocols", []) for iface in src_router_data.get("interfaces", []))
-        if not src_has_bgp:
-            print(f"⚠️ Il router {src} non ha BGP abilitato su nessuna interfaccia.")
+        if 'bgp' not in routers.get(src, {}).get('protocols', []):
+            print(f"⚠️ Il router {src} non ha BGP abilitato.")
             continue
         fpath = os.path.join(base_path, src, 'etc', 'frr', 'frr.conf')
         if not os.path.exists(fpath):
@@ -876,111 +1001,48 @@ def policies_menu(base_path, routers):
             insert_lines_into_protocol_block(fpath, proto='bgp', asn=None, lines=[f"neighbor {neigh_ip} route-map {rm_name} out"])
             print(f"✅ Aggiunta route-map {rm_name} (set metric {m_val}) su {src} per neighbor {neigh_ip} (out).")
 
-def get_first_iface_ip(ifaces):
-    # ritorna l'IP (senza /prefisso) della prima interfaccia fornita
-    if not ifaces:
-        return None
-    ip_cidr = ifaces[0].get("ip")
-    if not ip_cidr:
-        return None
-    return ip_cidr.split("/")[0]
 
-def find_routers_by_asn(routers, asn):
-    return [name for name, r in routers.items() if str(r.get("asn","")) == str(asn)]
+def menu_post_creazione(base_path, routers):
+    while True:
+        print("\n=== Menu post-creazione (scegli un'opzione) ===\n")
+        print('1) Imposta costo OSPF su una interfaccia di un router')
+        print('2) Rigenera file XML del laboratorio (da file modificati)')
+        print('3) Genera comando ping per tutti gli indirizzi del lab (copia/incolla)')
+        print('4) Policies (prefix-list / route-map semplificate per BGP)')
+        print('0) Torna indietro / Esci dal menu\n')
+        choice = input('Seleziona (numero): ').strip()
+        if choice == '0':
+            # torna al menu precedente
+            break
+        if choice == '1':
+            assegna_costo_interfaccia(base_path, routers)
+        elif choice == '2':
+            # rigenera XML leggendo lab.conf / startup / etc per ricostruire lo stato corrente
+            try:
+                xmlpath = rebuild_lab_metadata_and_export(base_path)
+                if xmlpath:
+                    print(f"✅ XML rigenerato: {xmlpath}")
+                else:
+                    print("❌ Rigenerazione XML non riuscita.")
+            except Exception as e:
+                print('Errore durante la rigenerazione XML:', e)
+        elif choice == '3':
+            try:
+                ips = collect_lab_ips(base_path, routers)
+                if not ips:
+                    print('Nessun IP trovato nel lab. Controlla i file .startup o le interfacce dei router.')
+                else:
+                    cmd = generate_ping_oneliner(ips)
+                    print('\n=== Comando ping generato (copia/incolla sulle macchine del lab) ===\n\n')
+                    print(cmd)
+                    print('\n\n=== Fine comando ===\n')
+            except Exception as e:
+                print('Errore generando il comando ping:', e)
+        elif choice == '4':
+            policies_menu(base_path, routers)
+        else:
+            print('Scelta non valida, riprova.')
 
-def assegna_costo_interfaccia(base_path, routers):
-    print('\n--- Assegna costo OSPF su una interfaccia di un router ---')
-    target = select_router(routers, prompt='Seleziona il router su cui impostare il costo OSPF:')
-    if not target:
-        print('Operazione annullata.')
-        return
-    # Validation: il router deve avere OSPF abilitato
-    target_has_ospf = any("ospf" in iface.get("protocols", []) for iface in routers.get(target, {}).get("interfaces", []))
-    if not target_has_ospf:
-        print(f"⚠️ Il router {target} non ha OSPF abilitato su nessuna interfaccia. Abilita OSPF prima di impostare il costo.")
-        return
-    iface = select_interface(routers[target])
-    if not iface:
-        print('Interfaccia non selezionata. Annullato.')
-        return
-    costo = input_int(f'Inserisci il costo OSPF desiderato per {iface} (intero ≥ 1): ', 1)
-    stanza = f"interface {iface}\n    ip ospf cost {costo}\n"
-    if append_frr_stanza(base_path, target, stanza):
-        print(f"✅ Costo impostato su {target} {iface} = {costo} (append su frr.conf).")
-
-# implementa_relazioni_as: rimosso — usare la creazione manuale di neighbor o riabilitare se necessario
-
-# asboh_lookup_option: rimosso — l'operazione richiede consultazione esterna
-
-# filter_as10_from_as60: rimosso — puoi riattivare la versione interattiva se ti serve
-
-def preferenza_as50r1(base_path, routers):
-    print('\n--- Imposta preferenza su un router per privilegiar annunci da un neighbor ---')
-    src = select_router(routers, prompt='Seleziona il router sorgente che deve preferire gli annunci:')
-    if not src:
-        print('Operazione annullata.')
-        return
-    print('Seleziona il router preferito (neighbor) dalla lista, o premi invio per inserire IP/ASN manualmente:')
-    neigh = select_router(routers, prompt='Seleziona il router preferito (neighbor):')
-    if neigh:
-        neigh_asn = routers[neigh].get('asn')
-        neigh_ip = get_first_iface_ip(routers[neigh]['interfaces'])
-    else:
-        neigh_asn = input_non_vuoto('ASN del router preferito (es. 70): ')
-        neigh_ip = input_non_vuoto('IP del neighbor (es. 10.0.0.2): ')
-    if not neigh_ip or not neigh_asn:
-        print('Informazioni incomplete; annullato.')
-        return
-    # strip CIDR if user or source provided it accidentally
-    neigh_ip = neigh_ip.split('/')[0] if '/' in neigh_ip else neigh_ip
-    # route-map (globale)
-    policy_lines = [f"route-map PREF_FROM_{neigh_ip.replace('.', '_')} permit 10",
-                    f"    match ip address prefix-list any",
-                    f"    set local-preference 200",
-                    ""]
-    # neighbor lines (da inserire sotto router bgp)
-    neighbor_lines = [f"neighbor {neigh_ip} remote-as {neigh_asn}",
-                      f"neighbor {neigh_ip} route-map PREF_FROM_{neigh_ip.replace('.', '_')} in"]
-    # append policy globalmente
-    with open(os.path.join(base_path, src, 'etc', 'frr', 'frr.conf'), 'a') as f:
-        for L in policy_lines:
-            f.write(L + "\n")
-    # inserisci neighbor nel blocco router bgp
-    insert_lines_into_protocol_block(os.path.join(base_path, src, 'etc', 'frr', 'frr.conf'), proto='bgp', asn=None, lines=neighbor_lines)
-    print(f"✅ Aggiunta preferenza su {src} per annunci provenienti da {neigh_ip} (ASN {neigh_asn}).")
-
-def visualizza_riepilogo_laboratorio(base_path, routers, hosts, www_servers):
-    """Stampa un riepilogo testuale della topologia del laboratorio."""
-    print("\n" + "="*15 + " Riepilogo del Laboratorio " + "="*15)
-
-    if not routers and not hosts and not www_servers:
-        print("Il laboratorio è vuoto.")
-        return
-
-    # Riepilogo per dispositivo
-    print("\n--- Dispositivi ---")
-    for rname, rdata in routers.items():
-        print(f"\n[Router] {rname}")
-        active_protocols = sorted(list(set(p for iface in rdata.get("interfaces", []) for p in iface.get("protocols", []))))
-        print(f"  - Protocolli attivi: {', '.join(active_protocols) if active_protocols else 'Nessuno'}")
-        if 'bgp' in active_protocols:
-            print(f"  - ASN: {rdata.get('asn', 'N/A')}")
-        for iface in rdata.get('interfaces', []):
-            print(f"  - Interfaccia {iface['name']}: {iface['ip']} (LAN: {iface['lan']})")
-
-    for hname, hdata in hosts.items():
-        print(f"\n[Host] {hname}")
-        print(f"  - IP: {hdata['ip']}")
-        print(f"  - Gateway: {hdata['gw'].split('/')[0]}")
-        print(f"  - LAN: {hdata['lan']}")
-
-    for wname, wdata in www_servers.items():
-        print(f"\n[Server WWW] {wname}")
-        print(f"  - IP: {wdata['ip']}")
-        print(f"  - Gateway: {wdata['gw'].split('/')[0]}")
-        print(f"  - LAN: {wdata['lan']}")
-
-    print("\n" + "="*45)
 
 def export_lab_to_xml(lab_name, lab_path, routers, hosts, wwws):
     """Esporta una rappresentazione XML del laboratorio in `lab_path/<lab_name>.xml`.
@@ -995,11 +1057,10 @@ def export_lab_to_xml(lab_name, lab_path, routers, hosts, wwws):
         routers_el = ET.SubElement(root, 'routers')
         for rname, rdata in routers.items():
             r_el = ET.SubElement(routers_el, 'router', attrib={'name': rname})
-            # Nota: 'protocols' a livello di router non esiste più. L'informazione è per-interfaccia.
-            # La manteniamo qui per compatibilità con la logica di importazione, aggregando i protocolli.
-            active_protocols = sorted(list(set(p for iface in rdata.get("interfaces", []) for p in iface.get("protocols", []))))
-            for p in active_protocols:
-                ET.SubElement(r_el, 'protocols').text = p
+            prot_el = ET.SubElement(r_el, 'protocols')
+            for p in rdata.get('protocols', []):
+                p_el = ET.SubElement(prot_el, 'protocol')
+                p_el.text = str(p)
             asn = rdata.get('asn', '')
             if asn:
                 asn_el = ET.SubElement(r_el, 'asn')
@@ -1012,19 +1073,15 @@ def export_lab_to_xml(lab_name, lab_path, routers, hosts, wwws):
                         'lan': iface.get('lan', ''),
                         'ip': iface.get('ip', '')
                     }
-                    iface_el = ET.SubElement(ifs_el, 'interface', attrib=attrib)
-                    # Salva anche i protocolli per interfaccia
-                    iface_protocols = iface.get('protocols', [])
-                    for p in iface_protocols:
-                        ET.SubElement(iface_el, 'protocol').text = p
+                    ET.SubElement(ifs_el, 'interface', attrib=attrib)
 
         hosts_el = ET.SubElement(root, 'hosts')
-        for hname, hdata in hosts.items():
-            ET.SubElement(hosts_el, 'host', attrib={'name': hname, 'ip': hdata.get('ip', ''), 'gw': hdata.get('gw', ''), 'lan': hdata.get('lan', '')})
+        for h in hosts:
+            ET.SubElement(hosts_el, 'host', attrib={'name': h.get('name', ''), 'ip': h.get('ip', ''), 'gateway': h.get('gateway', ''), 'lan': h.get('lan', '')})
 
         www_el = ET.SubElement(root, 'www')
-        for wname, wdata in wwws.items():
-            ET.SubElement(www_el, 'server', attrib={'name': wname, 'ip': wdata.get('ip', ''), 'gw': wdata.get('gw', ''), 'lan': wdata.get('lan', '')})
+        for w in wwws:
+            ET.SubElement(www_el, 'server', attrib={'name': w.get('name', ''), 'ip': w.get('ip', ''), 'gateway': w.get('gateway', ''), 'lan': w.get('lan', '')})
 
         # include lab.conf content se presente
         try:
@@ -1045,11 +1102,11 @@ def export_lab_to_xml(lab_name, lab_path, routers, hosts, wwws):
         print(f"✅ Esportato XML: {out_path}")
     except Exception as e:
         print('Errore esportazione XML:', e)
-
+ 
 # Funzionalità di caricamento non-interattivo (XML/JSON) e ricreazione lab
 def load_lab_from_xml(path):
     """Carica un lab da file XML generato dallo script.
-    Ritorna: lab_name, routers(dict), hosts(dict), wwws(dict), lab_conf_text(str or None)
+    Ritorna: lab_name, routers(dict), hosts(list), wwws(list), lab_conf_text(str or None)
     """
     import xml.etree.ElementTree as ET
     tree = ET.parse(path)
@@ -1059,34 +1116,25 @@ def load_lab_from_xml(path):
     routers = {}
     for r in root.findall('./routers/router'):
         rname = r.attrib.get('name')
-        # Per retrocompatibilità, legge sia il vecchio formato (protocols/protocol) che il nuovo (protocols)
-        protocols = [p.text for p in r.findall('./protocols/protocol')] + [p.text for p in r.findall('./protocols')]
-        protocols = sorted(list(set(p for p in protocols if p)))
-
+        protocols = [p.text for p in r.findall('./protocols/protocol') if p.text]
         asn_el = r.find('asn')
         asn = asn_el.text if asn_el is not None else ''
         interfaces = []
         for it in r.findall('./interfaces/interface'):
-            # Legge i protocolli specifici dell'interfaccia
-            iface_protocols = [p.text for p in it.findall('protocol') if p.text]
             interfaces.append({
                 'name': it.attrib.get('name',''),
                 'lan': it.attrib.get('lan',''),
-                'ip': it.attrib.get('ip',''),
-                'protocols': iface_protocols
+                'ip': it.attrib.get('ip','')
             })
-        # La chiave 'bgp_extra_networks' non è salvata nell'XML, la inizializziamo vuota
-        routers[rname] = {'asn': asn, 'interfaces': interfaces, 'bgp_extra_networks': []}
+        routers[rname] = {'protocols': protocols, 'asn': asn, 'interfaces': interfaces}
 
-    hosts = {}
+    hosts = []
     for h in root.findall('./hosts/host'):
-        hname = h.attrib.get('name','')
-        hosts[hname] = {'ip': h.attrib.get('ip',''), 'gw': h.attrib.get('gateway',''), 'lan': h.attrib.get('lan','')}
+        hosts.append({'name': h.attrib.get('name',''), 'ip': h.attrib.get('ip',''), 'gateway': h.attrib.get('gateway',''), 'lan': h.attrib.get('lan','')})
 
-    wwws = {}
+    wwws = []
     for w in root.findall('./www/server'):
-        wname = w.attrib.get('name','')
-        wwws[wname] = {'ip': w.attrib.get('ip',''), 'gw': w.attrib.get('gateway',''), 'lan': w.attrib.get('lan','')}
+        wwws.append({'name': w.attrib.get('name',''), 'ip': w.attrib.get('ip',''), 'gateway': w.attrib.get('gateway',''), 'lan': w.attrib.get('lan','')})
 
     lab_conf_text = None
     lc = root.find('lab_conf')
@@ -1098,24 +1146,31 @@ def load_lab_from_xml(path):
 
 def load_lab_from_json(path):
     """Carica un lab da file JSON. Atteso schema simile all'XML prodotto.
-    Ritorna: lab_name, routers(dict), hosts(dict), wwws(dict), lab_conf_text(str or None)
+    Ritorna: lab_name, routers(dict), hosts(list), wwws(list), lab_conf_text(str or None)
     """
     with open(path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     lab_name = data.get('lab', {}).get('name') or data.get('name') or os.path.splitext(os.path.basename(path))[0]
-    routers = data.get('routers', {})
-    hosts = data.get('hosts', {})
-    wwws = data.get('www_servers', {})
+    routers = {}
+    for r in data.get('routers', []):
+        rname = r.get('name')
+        protocols = r.get('protocols', [])
+        asn = r.get('asn', '')
+        interfaces = r.get('interfaces', [])
+        routers[rname] = {'protocols': protocols, 'asn': asn, 'interfaces': interfaces}
+    hosts = data.get('hosts', []) or []
+    wwws = data.get('www', []) or data.get('wwws', []) or []
     lab_conf_text = data.get('lab_conf') or None
     return lab_name, routers, hosts, wwws, lab_conf_text
 
 
-def recreate_lab_from_data(lab_name, base, routers, hosts, www_servers, lab_conf_text=None):
+def recreate_lab_from_data(lab_name, base, routers, hosts, wwws, lab_conf_text=None):
     """Ricrea il lab sul filesystem usando le funzioni esistenti.
     Restituisce il percorso `lab_path` creato.
     """
     lab_path = os.path.join(base, lab_name)
     if os.path.exists(lab_path):
+        # rimuovi esistente per ricreare
         if os.path.isdir(lab_path):
             shutil.rmtree(lab_path)
         else:
@@ -1127,243 +1182,313 @@ def recreate_lab_from_data(lab_name, base, routers, hosts, www_servers, lab_conf
         crea_router_files(lab_path, rname, rdata)
 
     # crea hosts
-    for hname, hdata in hosts.items():
-        crea_host_file(lab_path, hname, hdata['ip'], hdata['gw'], hdata['lan'])
+    for h in hosts:
+        try:
+            crea_host_file(lab_path, h.get('name'), h.get('ip'), h.get('gateway'), h.get('lan'))
+        except Exception:
+            pass
 
     # crea webservers
-    for wname, wdata in www_servers.items():
-        crea_www_file(lab_path, wname, wdata['ip'], wdata['gw'], wdata['lan'])
+    for w in wwws:
+        try:
+            crea_www_file(lab_path, w.get('name'), w.get('ip'), w.get('gateway'), w.get('lan'))
+        except Exception:
+            pass
 
-    # scrivi lab.conf se fornito
+    # scrivi lab.conf se fornito (altrimenti lo lascio come prima)
     if lab_conf_text:
-        with open(os.path.join(lab_path, 'lab.conf'), 'w', encoding='utf-8') as f:
-            f.write(lab_conf_text)
-    else: # Ricostruisci lab.conf dai dati se non fornito
-        lab_conf_lines = [LAB_CONF_HEADER.strip()]
-        all_nodes = {**routers, **hosts, **www_servers}
-        for name, data in all_nodes.items():
-            if name in routers:
-                for i, iface in enumerate(data['interfaces']):
-                    lab_conf_lines.append(f"{name}[{i}]={iface['lan']}")
-                lab_conf_lines.append(f'{name}[image]="kathara/frr"')
-            else:
-                lab_conf_lines.append(f"{name}[0]={data['lan']}")
-                lab_conf_lines.append(f'{name}[image]="kathara/base"')
-            lab_conf_lines.append("")
-        with open(os.path.join(lab_path, "lab.conf"), "w") as f:
-            f.write("\n".join(lab_conf_lines).strip() + "\n")
+        try:
+            with open(os.path.join(lab_path, 'lab.conf'), 'w', encoding='utf-8') as f:
+                f.write(lab_conf_text)
+        except Exception:
+            pass
 
     # auto-generate BGP neighbors
     auto_generate_bgp_neighbors(lab_path, routers)
 
     # esporta XML (aggiorna o crea)
-    export_lab_to_xml(lab_name, lab_path, routers, hosts, www_servers)
+    try:
+        export_lab_to_xml(lab_name, lab_path, routers, hosts, wwws)
+    except Exception:
+        pass
 
     return lab_path
+
 
 def parse_lab_conf_for_nodes(lab_path):
     """Parse `lab.conf` per ricavare nodi, mapping interfacce->LAN e immagini.
     Ritorna: nodes dict with keys: name -> {'interfaces': {idx: lan}, 'image': image}
     """
+    import re
     nodes = {}
     conf_path = os.path.join(lab_path, 'lab.conf')
-    if not os.path.exists(conf_path): return nodes
-    with open(conf_path, 'r', encoding='utf-8') as f:
-        lines = [L.strip() for L in f if L.strip()]
+    if not os.path.exists(conf_path):
+        return nodes, None
+    lab_conf_text = None
+    try:
+        with open(conf_path, 'r', encoding='utf-8') as f:
+            lab_conf_text = f.read()
+    except Exception:
+        return nodes, None
+
+    lines = [L.strip() for L in lab_conf_text.splitlines() if L.strip()]
+    # pattern: name[index]=value
     p = re.compile(r"^(?P<name>[^\[]+)\[(?P<idx>[^\]]+)\]=(?:\"(?P<qval>.*)\"|(?P<val>.*))$")
     for L in lines:
         m = p.match(L)
-        if not m: continue
-        name, idx, val = m.group('name'), m.group('idx'), (m.group('qval') if m.group('qval') is not None else m.group('val')).strip()
+        if not m:
+            continue
+        name = m.group('name')
+        idx = m.group('idx')
+        val = m.group('qval') if m.group('qval') is not None else m.group('val')
+        val = val.strip()
         node = nodes.setdefault(name, {'interfaces': {}, 'image': ''})
-        if idx == 'image': node['image'] = val.strip('"')
-        else: node['interfaces'][int(idx)] = val
-    return nodes
+        if idx == 'image':
+            node['image'] = val.strip('"')
+        else:
+            # treat as interface index
+            try:
+                node['interfaces'][int(idx)] = val
+            except Exception:
+                node['interfaces'][idx] = val
+    return nodes, lab_conf_text
+
 
 def rebuild_lab_metadata_and_export(lab_path):
-    """Ricostruisce routers/hosts/www dal filesystem (lab.conf, startup, etc) e rigenera l'XML."""
+    """Ricostruisce routers/hosts/www dal filesystem (lab.conf, startup, etc) e rigenera l'XML.
+    Restituisce il percorso del file XML creato o None in caso di errore.
+    """
     lab_name = os.path.basename(os.path.normpath(lab_path))
-    nodes = parse_lab_conf_for_nodes(lab_path)
-    routers, hosts, www_servers = {}, {}, {}
+    nodes, lab_conf_text = parse_lab_conf_for_nodes(lab_path)
+    routers = {}
+    hosts = []
+    wwws = []
+
     for name, meta in nodes.items():
-        if 'frr' in meta.get('image', ''):
+        image = meta.get('image','')
+        # collect interfaces: build list of dicts {name, lan, ip}
+        ifaces = []
+        for idx, lan in sorted(meta.get('interfaces', {}).items(), key=lambda x: int(x[0]) if isinstance(x[0], int) or x[0].isdigit() else 0):
+            eth = f"eth{idx}"
+            ifaces.append({'name': eth, 'lan': lan, 'ip': ''})
+
+        # read startup file for IPs and gateways
+        startup_path = os.path.join(lab_path, f"{name}.startup")
+        if os.path.exists(startup_path):
+            try:
+                with open(startup_path, 'r', encoding='utf-8') as f:
+                    for L in f:
+                        Ls = L.strip()
+                        if not Ls:
+                            continue
+                        # ip address add <ip> dev <iface>
+                        parts = Ls.split()
+                        if len(parts) >= 5 and parts[0] == 'ip' and parts[1] == 'address' and parts[2] == 'add':
+                            ip = parts[3]
+                            dev = parts[5] if len(parts) > 5 and parts[4] == 'dev' else None
+                            if dev:
+                                for it in ifaces:
+                                    if it['name'] == dev:
+                                        it['ip'] = ip
+                        # gateway extraction for hosts/www: 'ip route add default via <gw> dev eth0'
+                        if len(parts) >= 7 and parts[0] == 'ip' and parts[1] == 'route' and parts[2] == 'add' and parts[3] == 'default' and parts[4] == 'via':
+                            gw = parts[5]
+                            # attach gateway to a host/www entry later
+            except Exception:
+                pass
+
+        # if it's a FRR router image (heuristic)
+        if 'frr' in image.lower() or 'kathara/frr' in image.lower():
+            # detect protocols and ASN from etc/frr/frr.conf
             frr_conf = os.path.join(lab_path, name, 'etc', 'frr', 'frr.conf')
-            protos, asn = [], ''
-            # Questa logica è un'approssimazione. La fonte di verità sono le interfacce.
+            protos = []
+            asn = ''
             if os.path.exists(frr_conf):
-                with open(frr_conf, 'r') as f: txt = f.read()
-                if 'router bgp' in txt: protos.append('bgp'); m = re.search(r'router bgp\s+(\d+)', txt); asn = m.group(1) if m else ''
-                if 'router ospf' in txt: protos.append('ospf')
-                if 'router rip' in txt: protos.append('rip')
-            
-            # La logica per ricostruire i protocolli per interfaccia da frr.conf sarebbe complessa.
-            # Per ora, lasciamo i protocolli delle interfacce vuoti durante la rigenerazione.
-            # Durante la rigenerazione, non possiamo sapere quali protocolli sono su quali interfacce
-            # senza un parsing molto complesso di frr.conf. Applichiamo i protocolli globali a tutte le interfacce
-            # come approssimazione.
-            ifaces = [{'name': f"eth{idx}", 'lan': lan, 'ip': '', 'protocols': protos} for idx, lan in sorted(meta.get('interfaces', {}).items())]
-            routers[name] = {'asn': asn, 'interfaces': ifaces}
+                try:
+                    with open(frr_conf, 'r', encoding='utf-8') as f:
+                        txt = f.read()
+                    if 'router bgp' in txt:
+                        protos.append('bgp')
+                        import re
+                        m = re.search(r'router bgp\s+(\d+)', txt)
+                        if m:
+                            asn = m.group(1)
+                    if 'router ospf' in txt:
+                        protos.append('ospf')
+                    if 'router rip' in txt:
+                        protos.append('rip')
+                except Exception:
+                    pass
+            routers[name] = {'protocols': protos, 'asn': asn, 'interfaces': ifaces}
         else:
-            ip_val, gw_val = '', ''
+            # decide host vs www by checking for www index file
+            www_index = os.path.join(lab_path, name, 'var', 'www', 'html', 'index.html')
+            # attempt to read IP/gateway from startup if present
+            ip_val = ''
+            gw_val = ''
             startup_path = os.path.join(lab_path, f"{name}.startup")
             if os.path.exists(startup_path):
-                with open(startup_path, 'r') as f:
-                    for L in f:
-                        if 'ip address add' in L: ip_val = L.strip().split()[3]
-                        if 'ip route add default via' in L: gw_val = L.strip().split()[5]
-            lan = meta.get('interfaces', {}).get(0, '')
-            if os.path.exists(os.path.join(lab_path, name, 'var', 'www', 'html', 'index.html')):
-                www_servers[name] = {'ip': ip_val, 'gw': gw_val, 'lan': lan}
+                try:
+                    with open(startup_path, 'r', encoding='utf-8') as f:
+                        for L in f:
+                            if 'ip address add' in L:
+                                parts = L.strip().split()
+                                if len(parts) >= 4:
+                                    ip_val = parts[3]
+                            if 'ip route add default via' in L:
+                                parts = L.strip().split()
+                                if len(parts) >= 6:
+                                    gw_val = parts[5]
+                except Exception:
+                    pass
+            if os.path.exists(www_index):
+                wwws.append({'name': name, 'ip': ip_val, 'gateway': gw_val, 'lan': meta.get('interfaces', {}).get(0, '')})
             else:
-                hosts[name] = {'ip': ip_val, 'gw': gw_val, 'lan': lan}
-    out_path = os.path.join(lab_path, f"{lab_name}.xml")
-    export_lab_to_xml(lab_name, lab_path, routers, hosts, www_servers)
-    return out_path
+                hosts.append({'name': name, 'ip': ip_val, 'gateway': gw_val, 'lan': meta.get('interfaces', {}).get(0, '')})
 
-def menu_post_creazione(base_path, routers, hosts, www_servers):
-    while True:
-        print('\n=== Menu post-creazione (scegli un\'opzione) ===')
-        print('1) Imposta costo OSPF su una interfaccia di un router')
-        print('2) Imposta preferenza (local-preference) per annunci da un neighbor')
-        print('3) Modifica la configurazione di un router (frr.conf)')
-        print('4) Policies BGP (prefix-list / route-map semplificate)')
-        print('5) Rigenera file XML del laboratorio (da file modificati)')
-        print('6) Visualizza riepilogo laboratorio')
-        print('7) Genera comando ping per tutti gli indirizzi del lab')
-        print('0) Esci dal menu')
-        choice = input('Seleziona (numero): ').strip() 
-        if choice == '0':
-            break
-        elif choice == '1':
-            assegna_costo_interfaccia(base_path, routers)
-        elif choice == '2':
-            preferenza_as50r1(base_path, routers)
-        elif choice == '3':
-            modifica_router_menu(base_path, routers)
-        elif choice == '4': # Policies
-            policies_menu(base_path, routers)
-        elif choice == '5': # Rigenera XML
-            try:
-                xmlpath = rebuild_lab_metadata_and_export(base_path)
-                if xmlpath:
-                    print(f"✅ XML rigenerato: {xmlpath}")
-                else:
-                    print("❌ Rigenerazione XML non riuscita.")
-            except Exception as e:
-                print('Errore durante la rigenerazione XML:', e)
-        elif choice == '6': # Riepilogo
-            visualizza_riepilogo_laboratorio(base_path, routers, hosts, www_servers)
-        elif choice == '7': # Ping
-            try:
-                ips = collect_lab_ips(base_path, routers)
-                if not ips:
-                    print('Nessun IP trovato nel lab. Controlla i file .startup o le interfacce dei router.')
-                else:
-                    cmd = generate_ping_oneliner(ips)
-                    print('\n=== Comando ping generato (copia/incolla sulle macchine del lab) ===\n\n')
-                    print(cmd)
-                    print('\n\n=== Fine comando ===\n')
-            except Exception as e:
-                print('Errore generando il comando ping:', e)
-        else:
-            print('Scelta non valida, riprova.')
-
-def conferma(prompt="Confermi? (s/N): "):
-    """Chiede una conferma sì/no all'utente."""
-    ans = input(prompt).strip().lower()
-    if ans.startswith('s'):
-        return True
-    print("❌ Operazione annullata.")
-    return False
+    try:
+        export_lab_to_xml(lab_name, lab_path, routers, hosts, wwws)
+        return os.path.join(lab_path, f"{lab_name}.xml")
+    except Exception as e:
+        print('Errore rigenerazione XML:', e)
+        return None
 
 # -------------------------
 # Main
 # -------------------------
 def main():
     # supporto modalità non-interattiva: --from-xml / --from-json
-    parser = argparse.ArgumentParser(description='Generatore Kathará v11')
+    parser = argparse.ArgumentParser(description='Generatore Kathará')
     parser.add_argument('--from-xml', help='Percorso file XML da importare per creare il lab')
     parser.add_argument('--from-json', help='Percorso file JSON da importare per creare il lab')
     parser.add_argument('--regen-xml', help='Percorso della directory del lab per rigenerare il file XML')
-    args, _ = parser.parse_known_args()
+    args, remaining = parser.parse_known_args()
 
     base = os.getcwd()
 
+    # Se forniti via CLI, manteniamo il comportamento non-interattivo
     if args.regen_xml:
         out = rebuild_lab_metadata_and_export(args.regen_xml)
-        if out: print(f"✅ XML rigenerato: {out}")
-        else: print("❌ Rigenerazione XML fallita.")
+        if out:
+            print(f"✅ XML rigenerato: {out}")
+        else:
+            print("❌ Rigenerazione XML fallita.")
         return
-
     if args.from_xml or args.from_json:
-        try:
-            if args.from_xml:
-                lab_name, routers, hosts, www_servers, lab_conf_text = load_lab_from_xml(args.from_xml)
-            else: # from-json
-                lab_name, routers, hosts, www_servers, lab_conf_text = load_lab_from_json(args.from_json)
-            lab_path = recreate_lab_from_data(lab_name, base, routers, hosts, www_servers, lab_conf_text)
-            print(f"✅ Lab '{lab_name}' creato da file in: {lab_path}")
-            # Mostra il menu post-creazione anche dopo l'importazione
-            print("\nAvvio del menu post-creazione...")
-            menu_post_creazione(lab_path, routers, hosts, www_servers)
-        except Exception as e:
-            print(f"❌ Errore durante l'importazione da riga di comando: {e}", file=sys.stderr)
+        if args.from_xml:
+            lab_name, routers, hosts, wwws, lab_conf_text = load_lab_from_xml(args.from_xml)
+        else:
+            lab_name, routers, hosts, wwws, lab_conf_text = load_lab_from_json(args.from_json)
+        lab_path = recreate_lab_from_data(lab_name, base, routers, hosts, wwws, lab_conf_text)
+        print(f"✅ Lab '{lab_name}' creato (non-interattivo) in: {lab_path}")
         return
 
-    # Modalità interattiva
-    print("=== Generatore Kathará v11 ===")
-    print("Scegli modalità:\n  C - Crea nuovo laboratorio (interattivo)\n  I - Importa da file (XML/JSON)\n  G - Rigenera XML di un lab esistente\n  P - Policies BGP su lab esistente\n  T - Test connettività (ping) su lab esistente\n  Q - Esci")
+    # Modalità interattiva: chiedi all'utente se creare o importare
+    print("=== Generatore Kathará ===\n")
+    print("Scegli modalità:\n")
+    print("  C - Crea nuovo laboratorio (interattivo)")
+    print("  I - Importa da file (XML/JSON)")
+    print("  R - Rigenera XML di un lab esistente")
+    print("  G - Genera comando ping per un lab esistente (copia/incolla)")
+    print("  P - Policies (applica prefix-list / route-map a router BGP esistenti)")
+    print("  Q - Esci\n")
     while True:
-        mode = input_non_vuoto("Seleziona (C/I/G/Q): ").strip().lower()
-        if mode.startswith('q'): print('Uscita.'); return
+        mode = input_non_vuoto("Seleziona (C/I/R/G/P/Q): ").strip().lower()
+        if not mode:
+            continue
+        if mode.startswith('q'):
+            print('Uscita.')
+            return
         if mode.startswith('c'):
+            # procedi con il flusso interattivo classico
             lab_name = input_non_vuoto("Nome del laboratorio: ")
             lab_path = os.path.join(base, lab_name)
             break
         if mode.startswith('i'):
             file_path = input_non_vuoto("Percorso del file XML/JSON da importare: ")
-            if not os.path.exists(file_path): print(f"File non trovato: {file_path}"); continue
-            main_args = ['--from-xml', file_path] if file_path.endswith('.xml') else ['--from-json', file_path]
-            # Rilancia main() con gli argomenti per l'importazione, che ora mostrerà il menu
-            sys.argv = [sys.argv[0]] + main_args; main(); return
-        if mode.startswith('g'):
-            target = input_non_vuoto('Percorso della directory del lab da cui rigenerare l\'XML: ')
-            if not os.path.isdir(target): print(f"Directory non trovata: {target}"); continue
-            # Rilancia main() con l'argomento per la rigenerazione
-            sys.argv = [sys.argv[0], '--regen-xml', target]; main(); return
-        if mode.startswith('p'): # Policies
-            target = input_non_vuoto('Percorso della directory del lab su cui applicare policies: ')
-            if not os.path.isdir(target): print(f"Directory non trovata: {target}"); continue
-            xmlpath = os.path.join(target, os.path.basename(os.path.normpath(target)) + '.xml')
+            if not os.path.exists(file_path):
+                print(f"File non trovato: {file_path}")
+                continue
+            ext = os.path.splitext(file_path)[1].lower()
             try:
-                if os.path.exists(xmlpath):
-                    _, routers_meta, _, _, _ = load_lab_from_xml(xmlpath)
+                if ext == '.xml':
+                    lab_name, routers, hosts, wwws, lab_conf_text = load_lab_from_xml(file_path)
+                elif ext == '.json':
+                    lab_name, routers, hosts, wwws, lab_conf_text = load_lab_from_json(file_path)
                 else:
-                    out = rebuild_lab_metadata_and_export(target)
-                    if not out: print('Impossibile generare metadata del lab.'); continue
-                    _, routers_meta, _, _, _ = load_lab_from_xml(out)
-                policies_menu(target, routers_meta)
+                    # tenta XML prima, poi JSON
+                    try:
+                        lab_name, routers, hosts, wwws, lab_conf_text = load_lab_from_xml(file_path)
+                    except Exception:
+                        lab_name, routers, hosts, wwws, lab_conf_text = load_lab_from_json(file_path)
+                lab_path = recreate_lab_from_data(lab_name, base, routers, hosts, wwws, lab_conf_text)
+                print(f"✅ Lab '{lab_name}' creato da file in: {lab_path}")
+                return
             except Exception as e:
-                print('Errore caricando il lab o aprendo policies:', e)
-            continue # torna al menu principale
-        if mode.startswith('t'): # Test ping
+                print('Errore importando il file:', e)
+                continue
+        if mode.startswith('r'):
+            target = input_non_vuoto('Percorso della directory del lab da cui rigenerare l\'XML: ')
+            if not os.path.isdir(target):
+                print(f"Directory non trovata: {target}")
+                continue
+            out = rebuild_lab_metadata_and_export(target)
+            if out:
+                print(f"✅ XML rigenerato: {out}")
+            else:
+                print("❌ Rigenerazione XML fallita.")
+            return
+        if mode.startswith('g'):
             target = input_non_vuoto('Percorso della directory del lab per generare il comando ping: ')
-            if not os.path.isdir(target): print(f"Directory non trovata: {target}"); continue
+            if not os.path.isdir(target):
+                print(f"Directory non trovata: {target}")
+                continue
+            # proviamo a leggere routers.xml se presente (semplifica raccolta IP), ma la funzione
+            # collect_lab_ips può operare anche senza routers
             routers_meta = None
             try:
                 xmlpath = os.path.join(target, os.path.basename(os.path.normpath(target)) + '.xml')
                 if os.path.exists(xmlpath):
-                    _, routers_meta, _, _, _ = load_lab_from_xml(xmlpath)
-            except Exception: pass
+                    try:
+                        _, routers_meta, _, _, _ = load_lab_from_xml(xmlpath)
+                    except Exception:
+                        routers_meta = None
+            except Exception:
+                routers_meta = None
             ips = collect_lab_ips(target, routers_meta)
-            if not ips: print('Nessun IP trovato nella directory del lab.'); continue
+            if not ips:
+                print('Nessun IP trovato nella directory del lab. Controlla che ci siano file .startup o i router con interfacce.')
+                continue
             cmd = generate_ping_oneliner(ips)
             print('\n=== Comando ping generato (copia/incolla sulle macchine del lab) ===\n\n')
             print(cmd)
             print('\n\n=== Fine comando ===\n')
-            continue # torna al menu principale
+            # torna al menu principale
+            continue
+        if mode.startswith('p'):
+            target = input_non_vuoto('Percorso della directory del lab su cui applicare policies: ')
+            if not os.path.isdir(target):
+                print(f"Directory non trovata: {target}")
+                continue
+            # try to load existing XML for the lab, otherwise regenerate it
+            xmlpath = os.path.join(target, os.path.basename(os.path.normpath(target)) + '.xml')
+            try:
+                if os.path.exists(xmlpath):
+                    lab_name, routers_meta, _, _, _ = load_lab_from_xml(xmlpath)
+                else:
+                    out = rebuild_lab_metadata_and_export(target)
+                    if not out:
+                        print('Impossibile generare metadata del lab.')
+                        continue
+                    lab_name, routers_meta, _, _, _ = load_lab_from_xml(out)
+                # apri il sotto-menu Policies
+                policies_menu(target, routers_meta)
+            except Exception as e:
+                print('Errore caricando il lab o aprendo policies:', e)
+            # torna al menu principale
+            continue
         print('Scelta non valida, riprova.')
-    
+
     if os.path.exists(lab_path):
         ans = input("⚠️ Esiste già. Sovrascrivere? (s/n): ").strip().lower()
         if ans != "s":
@@ -1383,178 +1508,115 @@ def main():
 
     lab_conf_lines = [LAB_CONF_HEADER.strip()]
     routers = {}
-    hosts = {}
-    www_servers = {}
-    
+    # Collezioni per esportazione XML
+    hosts = []
+    wwws = []
+
     # Routers
     for i in range(1, n_router + 1):
+        default_name = f"r{i}"
         while True:
-            default_name = f"r{i}"
-            while True:
-                rname_in = input(f"\nNome router {i}/{n_router} (default {default_name}): ").strip()
-                rname = rname_in if rname_in else default_name
-                # basic validation: unique and no spaces
-                if rname in routers or rname in (line.split('[')[0] for line in lab_conf_lines):
-                    print(f"❌ Nome '{rname}' già usato. Scegli un altro.")
-                    continue
-                if ' ' in rname:
-                    print("❌ Il nome del router non può contenere spazi.")
-                    continue
-                break
-            print(f"--- Configurazione router {rname} ---")
-            
-            # L'ASN viene chiesto solo se almeno un'interfaccia userà BGP.
-            # Lo chiederemo dopo la configurazione delle interfacce.
-            asn = ""
-            bgp_extra_networks = []
-            prompt_for_asn = False
-            
-            while True: # Conferma per numero interfacce
-                n_if = input_int("Numero interfacce: ", 1)
-                if conferma(f"Confermi '{n_if}' interfacce per {rname}? (s/N): "):
-                    break
+            rname_in = input(f"\nNome router (default {default_name}): ").strip()
+            rname = rname_in if rname_in else default_name
+            # basic validation: unique and no spaces
+            if rname in routers:
+                print(f"Nome '{rname}' già usato. Scegli un altro.")
+                continue
+            if ' ' in rname:
+                print("Il nome del router non può contenere spazi.")
+                continue
+            break
+        print(f"--- Configurazione router {rname} ---")
+        protocols = valida_protocols(f"Protocolli attivi su {rname} (bgp/ospf/rip, separati da spazio/virgola): ")
+        asn = ""
+        if "bgp" in protocols:
+            asn = input_non_vuoto("Numero AS BGP: ")
+        n_if = input_int("Numero interfacce: ", 1)
+        interfaces = []
+        for idx in range(n_if):
+            eth = f"eth{idx}"
+            lan = input_lan(f"  LAN associata a {eth} (es. A): ")
+            ip_cidr = valida_ip_cidr(f"  IP per {eth} (es. 10.0.{i}.{idx}/24): ")
+            interfaces.append({"name": eth, "lan": lan, "ip": ip_cidr})
+            lab_conf_lines.append(f"{rname}[{idx}]={lan}")
+        # fine ciclo interfacce: aggiungi la riga image e la linea vuota una sola volta
+        lab_conf_lines.append(f'{rname}[image]="kathara/frr"')
+        lab_conf_lines.append("")  # blank line
+        # salva i dati del router e genera i file (frr.conf, startup, ecc.)
+        routers[rname] = {"protocols": protocols, "asn": asn, "interfaces": interfaces}
+        crea_router_files(lab_path, rname, routers[rname])
 
-            interfaces = []
-            for idx in range(n_if):
-                eth = f"eth{idx}"
-                while True:  # Conferma per LAN associata
-                    lan = valida_lan(f"  LAN per {eth} (es. A): ")
-                    if conferma(f"Confermi LAN '{lan}' per {eth}? (s/N): "):
-                        break
-                while True:  # Conferma per IP interfaccia
-                    ip_cidr = valida_ip_cidr(f"  IP/CIDR per {eth} (es. 10.0.{i}.{idx}/24): ")
-                    if conferma(f"Confermi IP '{ip_cidr}' per {eth}? (s/N): "):
-                        break
-                
-                while True: # Conferma per protocolli su questa interfaccia
-                    if_protocols = valida_protocols(f"  Protocolli per {eth} (bgp/ospf/rip, invio per nessuno): ")
-                    if conferma(f"Confermi protocolli '{', '.join(if_protocols) if if_protocols else 'Nessuno'}' per {eth}? (s/N): "):
-                        break
-                
-                if "bgp" in if_protocols:
-                    prompt_for_asn = True
-
-                interfaces.append({"name": eth, "lan": lan, "ip": ip_cidr, "protocols": if_protocols})
-            
-            # Se una qualsiasi interfaccia usa BGP, chiedi l'ASN per il router
-            if prompt_for_asn:
-                while True:
-                    asn = input_non_vuoto(f"Numero AS BGP per {rname}: ")
-                    if conferma(f"Confermi ASN '{asn}' per {rname}? (s/N): "):
-                        break
-                # Chiedi quali reti interne pubblicizzare in BGP
-                while True:
-                    extra_net_str = input(f"  Reti interne da annunciare via BGP per {rname} (es. 2.0.0.0/8, separate da spazio, invio per nessuna): ").strip()
-                    if not extra_net_str:
-                        break
-                    try:
-                        # Validazione preliminare
-                        bgp_extra_networks = [str(ipaddress.ip_network(n.strip())) for n in extra_net_str.split()]
-                        if conferma(f"Confermi di annunciare le reti: {', '.join(bgp_extra_networks)}? (s/N): "):
-                            break
-                    except ValueError as e:
-                        print(f"❌ Formato rete non valido: {e}. Riprova.")
-
-            
-            # Chiedi conferma prima di scrivere i file
-            if conferma(f"Vuoi creare il router '{rname}' con questa configurazione? (s/N): "):
-                for idx, iface in enumerate(interfaces):
-                    lab_conf_lines.append(f"{rname}[{idx}]={iface['lan']}")
-                
-                lab_conf_lines.append(f'{rname}[image]="kathara/frr"')
-                lab_conf_lines.append("")
-                
-                routers[rname] = {"asn": asn, "interfaces": interfaces, "bgp_extra_networks": bgp_extra_networks}
-                crea_router_files(lab_path, rname, routers[rname])
-                print(f"✅ Router '{rname}' creato.")
-                break # Esce dal ciclo while e passa al prossimo router
-            else:
-                print(f"Riprova la configurazione per il router {i}/{n_router}.")
+    
 
     # prepara l'insieme dei nomi già usati (router names)
     used_names = set(routers.keys())
 
     # Hosts
     for h in range(1, n_host + 1):
+        default_hname = f"host{h}"
         while True:
-            default_hname = f"host{h}"
-            while True:
-                hname_in = input(f"\nNome host {h}/{n_host} (default {default_hname}): ").strip()
-                hname = hname_in if hname_in else default_hname
-                if ' ' in hname:
-                    print("❌ Il nome non può contenere spazi.")
-                    continue
-                if hname in used_names:
-                    print(f"❌ Nome '{hname}' già usato. Scegli un altro.")
-                    continue
-                break
-            print(f"--- Configurazione host {hname} ---")
-            ip = valida_ip_cidr(f"IP/CIDR per {hname} (es. 192.168.10.{h}/24): ")
-            gw = valida_ip_senza_cidr(f"Gateway per {hname} (es. 192.168.10.1): ")
-            lan = valida_lan("LAN associata (es. A): ")
-
-            # Chiedi conferma prima di scrivere i file
-            if conferma(f"Vuoi creare l'host '{hname}' con questa configurazione? (s/N): "):
-                used_names.add(hname)
-                hosts[hname] = {"ip": ip, "gw": gw, "lan": lan}
-                crea_host_file(lab_path, hname, ip, gw, lan)
-                lab_conf_lines.append(f"{hname}[0]={lan}")
-                lab_conf_lines.append(f'{hname}[image]="kathara/base"')
-                lab_conf_lines.append("")
-                print(f"✅ Host '{hname}' creato.")
-                break # Esce dal ciclo while e passa al prossimo host
-            else:
-                print(f"Riprova la configurazione per l'host {h}/{n_host}.")
+            hname_in = input(f"\nNome host (default {default_hname}): ").strip()
+            hname = hname_in if hname_in else default_hname
+            if ' ' in hname:
+                print("Il nome non può contenere spazi.")
+                continue
+            if hname in used_names:
+                print(f"Nome '{hname}' già usato. Scegli un altro.")
+                continue
+            break
+        used_names.add(hname)
+        print(f"--- Configurazione host {hname} ---")
+        ip = valida_ip_cidr(f"IP per {hname} (es. 192.168.10.{h}/24): ")
+        gw = valida_ip_cidr(f"Gateway per {hname} (es. 192.168.10.1/24): ")
+        lan = input_lan("LAN associata (es. A): ")
+        crea_host_file(lab_path, hname, ip, gw, lan)
+        hosts.append({"name": hname, "ip": ip, "gateway": gw, "lan": lan})
+        lab_conf_lines.append(f"{hname}[0]={lan}")
+        lab_conf_lines.append(f'{hname}[image]="kathara/base"')
+        lab_conf_lines.append("")
 
     # WWW servers
     for w in range(1, n_www + 1):
+        default_wname = f"www{w}"
         while True:
-            default_wname = f"www{w}"
-            while True:
-                wname_in = input(f"\nNome webserver {w}/{n_www} (default {default_wname}): ").strip()
-                wname = wname_in if wname_in else default_wname
-                if ' ' in wname:
-                    print("❌ Il nome non può contenere spazi.")
-                    continue
-                if wname in used_names:
-                    print(f"❌ Nome '{wname}' già usato. Scegli un altro.")
-                    continue
-                break
-            print(f"--- Configurazione webserver {wname} ---")
-            ip = valida_ip_cidr(f"IP/CIDR per {wname} (es. 10.10.{w}.1/24): ")
-            gw = valida_ip_senza_cidr(f"Gateway per {wname} (es. 10.10.{w}.254): ")
-            lan = valida_lan("LAN associata (es. Z): ")
-
-            # Chiedi conferma prima di scrivere i file
-            if conferma(f"Vuoi creare il server WWW '{wname}' con questa configurazione? (s/N): "):
-                used_names.add(wname)
-                www_servers[wname] = {"ip": ip, "gw": gw, "lan": lan}
-                crea_www_file(lab_path, wname, ip, gw, lan)
-                lab_conf_lines.append(f"{wname}[0]={lan}")
-                lab_conf_lines.append(f'{wname}[image]="kathara/base"')
-                lab_conf_lines.append("")
-                print(f"✅ Server WWW '{wname}' creato.")
-                break # Esce dal ciclo while e passa al prossimo server
-            else:
-                print(f"Riprova la configurazione per il webserver {w}/{n_www}.")
+            wname_in = input(f"\nNome webserver (default {default_wname}): ").strip()
+            wname = wname_in if wname_in else default_wname
+            if ' ' in wname:
+                print("Il nome non può contenere spazi.")
+                continue
+            if wname in used_names:
+                print(f"Nome '{wname}' già usato. Scegli un altro.")
+                continue
+            break
+        used_names.add(wname)
+        print(f"--- Configurazione webserver {wname} ---")
+        ip = valida_ip_cidr(f"IP per {wname} (es. 10.10.{w}.1/24): ")
+        gw = valida_ip_cidr(f"Gateway per {wname} (es. 10.10.{w}.254/24): ")
+        lan = input_lan("LAN associata (es. Z): ")
+        crea_www_file(lab_path, wname, ip, gw, lan)
+        wwws.append({"name": wname, "ip": ip, "gateway": gw, "lan": lan})
+        lab_conf_lines.append(f"{wname}[0]={lan}")
+        lab_conf_lines.append(f'{wname}[image]="kathara/base"')
+        lab_conf_lines.append("")
 
     # write lab.conf
     with open(os.path.join(lab_path, "lab.conf"), "w") as f:
         f.write("\n".join(lab_conf_lines).strip() + "\n")
 
-    # Generazione automatica dei neighbor BGP e esportazione XML
+    # Auto-generate BGP neighbors for routers sharing LANs
     auto_generate_bgp_neighbors(lab_path, routers)
+
+    # Esporta il laboratorio in formato XML per poterlo riusare come input
     try:
-        export_lab_to_xml(lab_name, lab_path, routers, hosts, www_servers)
+        export_lab_to_xml(lab_name, lab_path, routers, hosts, wwws)
     except Exception as e:
         print('Attenzione: esportazione XML fallita:', e)
 
     print(f"\n✅ Lab '{lab_name}' creato in: {lab_path}")
     print("Nota: sono stati generati neighbor BGP automatici per router che condividono la stessa LAN.")
-    
     # Menu in italiano per implementare richieste aggiuntive
     try:
-        menu_post_creazione(lab_path, routers, hosts, www_servers)
+        menu_post_creazione(lab_path, routers)
     except Exception as e:
         print('Errore durante il menu post-creazione:', e)
 
